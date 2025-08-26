@@ -1,1 +1,240 @@
 ---
+- name: Deploy Neo4j Cluster
+  hosts: all
+  become: yes
+  vars:
+    neo4j_version: "5.15.0"
+    neo4j_home: "/opt/neo4j"
+    neo4j_user: "neo4j"
+    neo4j_group: "neo4j"
+    cluster_name: "neo4j-cluster"
+    initial_password: "neo4j-admin"
+    core_bolt_port_base: 7687
+    read_replica_bolt_port_base: 8687
+    http_port_base: 7474
+    https_port_base: 7473
+    backup_port_base: 6362
+    cluster_port_base: 5000
+    raft_port_base: 7000
+
+  vars_prompt:
+    - name: num_core_servers
+      prompt: "Enter the number of core servers"
+      private: no
+      default: 3
+    - name: num_read_replica_servers
+      prompt: "Enter the number of read replica servers"
+      private: no
+      default: 0
+    - name: server_type
+      prompt: "Enter server type for this machine (core/read_replica)"
+      private: no
+      default: "core"
+    - name: server_id
+      prompt: "Enter the server ID for this machine"
+      private: no
+      default: 1
+
+  tasks:
+    - name: Update package cache (Debian/Ubuntu)
+      ansible.builtin.apt:
+        update_cache: yes
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Install Java 17 (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: openjdk-17-jdk
+        state: present
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Install Java 17 (RHEL/CentOS)
+      ansible.builtin.yum:
+        name: java-17-openjdk-devel
+        state: present
+      when: ansible_pkg_mgr == 'yum'
+
+    - name: Create Neo4j group
+      ansible.builtin.group:
+        name: "{{ neo4j_group }}"
+        state: present
+        system: yes
+
+    - name: Create Neo4j user
+      ansible.builtin.user:
+        name: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        home: "{{ neo4j_home }}"
+        shell: /bin/bash
+        state: present
+        system: yes
+
+    - name: Ensure Neo4j home directory exists
+      ansible.builtin.file:
+        path: "{{ neo4j_home }}"
+        state: directory
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        mode: "0755"
+
+    - name: Download Neo4j Enterprise package
+      ansible.builtin.get_url:
+        url: "https://neo4j.com/artifact.php?name=neo4j-enterprise-{{ neo4j_version }}-unix.tar.gz"
+        dest: "/tmp/neo4j-enterprise-{{ neo4j_version }}-unix.tar.gz"
+        mode: "0644"
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+
+    - name: Unarchive Neo4j package
+      ansible.builtin.unarchive:
+        src: "/tmp/neo4j-enterprise-{{ neo4j_version }}-unix.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+
+    - name: Move unarchived Neo4j directory to current link target
+      ansible.builtin.command:
+        cmd: "mv /opt/neo4j-enterprise-{{ neo4j_version }} {{ neo4j_home }}/current"
+      args:
+        creates: "{{ neo4j_home }}/current/bin/neo4j"
+
+    - name: Set ownership and permissions for Neo4j home
+      ansible.builtin.file:
+        path: "{{ neo4j_home }}"
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        mode: "0755"
+        recurse: yes
+
+    - name: Create symlink for neo4j executable
+      ansible.builtin.file:
+        src: "{{ neo4j_home }}/current/bin/neo4j"
+        dest: "/usr/local/bin/neo4j"
+        state: link
+        force: yes
+
+    - name: Create symlink for neo4j-admin executable
+      ansible.builtin.file:
+        src: "{{ neo4j_home }}/current/bin/neo4j-admin"
+        dest: "/usr/local/bin/neo4j-admin"
+        state: link
+        force: yes
+
+    - name: Enable UFW (Debian/Ubuntu)
+      community.general.ufw:
+        state: enabled
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Allow SSH through UFW (Debian/Ubuntu)
+      community.general.ufw:
+        rule: allow
+        name: ssh
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Allow Neo4j ports through UFW (Debian/Ubuntu)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "7687:7697"
+        - "7474:7484"
+        - "7473:7483"
+        - "5000:5010"
+        - "7000:7010"
+        - "6362:6372"
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Enable and start Firewalld (RHEL/CentOS)
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+      when: ansible_pkg_mgr == 'yum'
+
+    - name: Allow Neo4j ports through Firewalld (RHEL/CentOS)
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+      loop:
+        - "7687-7697"
+        - "7474-7484"
+        - "7473-7483"
+        - "5000-5010"
+        - "7000-7010"
+        - "6362-6372"
+      when: ansible_pkg_mgr == 'yum'
+
+    - name: Reload Firewalld (RHEL/CentOS)
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      when: ansible_pkg_mgr == 'yum'
+
+    - name: Deploy Neo4j core server configuration
+      ansible.builtin.template:
+        src: neo4j.conf.j2
+        dest: "{{ neo4j_home }}/current/conf/neo4j.conf"
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        mode: "0644"
+      when: server_type == 'core'
+
+    - name: Deploy Neo4j read replica server configuration
+      ansible.builtin.template:
+        src: neo4j_read_replica.conf.j2
+        dest: "{{ neo4j_home }}/current/conf/neo4j.conf"
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        mode: "0644"
+      when: server_type == 'read_replica'
+
+    - name: Deploy Neo4j systemd service file
+      ansible.builtin.template:
+        src: neo4j.service.j2
+        dest: /etc/systemd/system/neo4j.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable Neo4j service
+      ansible.builtin.systemd:
+        name: neo4j
+        enabled: yes
+
+    - name: Start Neo4j service
+      ansible.builtin.systemd:
+        name: neo4j
+        state: started
+
+    - name: Pause for Neo4j service to start
+      ansible.builtin.pause:
+        seconds: 10
+      when: server_type == 'core'
+
+    - name: Set initial Neo4j password
+      ansible.builtin.command:
+        cmd: "{{ neo4j_home }}/current/bin/neo4j-admin dbms set-initial-password {{ initial_password }}"
+      become_user: "{{ neo4j_user }}"
+      args:
+        creates: "{{ neo4j_home }}/current/data/databases/neo4j/neostore.transaction.db.0"
+      when: server_type == 'core'
+
+    - name: Deploy cluster monitoring script
+      ansible.builtin.template:
+        src: cluster_monitor.sh.j2
+        dest: "{{ neo4j_home }}/cluster_monitor.sh"
+        owner: "{{ neo4j_user }}"
+        group: "{{ neo4j_group }}"
+        mode: "0755"
+
+    - name: Add cluster monitoring to crontab
+      ansible.builtin.cron:
+        name: "Neo4j Cluster Monitor"
+        minute: "*/5"
+        user: "{{ neo4j_user }}"
+        job: "{{ neo4j_home }}/cluster_monitor.sh"
